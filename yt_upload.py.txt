@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Ridvise Publisher — uploads a finished Ridvise video to the Ridvise YouTube channel.
+
+This is the uploader for the OAuth client under YouTube API Services review:
+Google Cloud project "ridvise-publisher" (project number 772198144313), OAuth client
+"Ridvise Composio uploader". It is a private, single-operator tool. It only ever uploads
+videos that Ridvise produced itself, and only to Ridvise's own channel
+(UCWEzr4vn2ja8_cMbEyxEG9g, youtube.com/@ridviseyt). It does not read, download, search,
+scrape or store anyone else's content, and there are no other users.
+
+Scope used: https://www.googleapis.com/auth/youtube.upload  (write-only; it cannot read
+another channel's data). `status` additionally needs youtube.readonly and is optional —
+the pipeline normally confirms a public upload by fetching the watch page instead, so the
+read quota stays untouched.
+
+Client id / secret live in ~/ClaudeBrain/secrets/google_ridvise_publisher_oauth.env
+(chmod 600, never printed, never committed). The refresh token is written next to them.
+
+    python3 yt_upload.py auth-url                     # one-time: print the consent URL
+    python3 yt_upload.py exchange <code>              # one-time: store the refresh token
+    python3 yt_upload.py upload out/v031/v031_yt.mp4 \
+        --title "..." --description "..." --tags shorts,money --privacy public
+    python3 yt_upload.py status <video_id>            # uploadStatus / processing result
+
+Upload call: resumable POST to
+    https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status
+with snippet{title, description, tags, categoryId "22"} and status{privacyStatus,
+selfDeclaredMadeForKids false}, then the file bytes PUT to the returned session URL.
+One video per scheduled slot; at most nine uploads a day.
+"""
+import argparse, json, os, sys, time, urllib.parse
+import requests
+
+SECRETS = os.path.expanduser("~/ClaudeBrain/secrets/google_ridvise_publisher_oauth.env")
+TOKENS = os.path.expanduser("~/ClaudeBrain/secrets/google_ridvise_publisher_token.json")
+REDIRECT = os.environ.get("RIDVISE_OAUTH_REDIRECT",
+                          "https://backend.composio.dev/api/v3/toolkits/auth/callback")
+SCOPE_UPLOAD = "https://www.googleapis.com/auth/youtube.upload"
+CHANNEL_ID = "UCWEzr4vn2ja8_cMbEyxEG9g"  # Ridvise. Never upload anywhere else.
+CHUNK = 8 * 1024 * 1024
+
+
+def client():
+    """Read the OAuth client id/secret. Returns them; never logs or prints them."""
+    cid = secret = None
+    with open(SECRETS) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("GOOGLE_CLIENT_ID="):
+                cid = line.split("=", 1)[1].strip().strip('"')
+            elif line.startswith("GOOGLE_CLIENT_SECRET="):
+                secret = line.split("=", 1)[1].strip().strip('"')
+    if not (cid and secret):
+        sys.exit(f"client id/secret missing from {SECRETS}")
+    return cid, secret
+
+
+def auth_url():
+    cid, _ = client()
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": cid, "redirect_uri": REDIRECT, "response_type": "code",
+        "scope": SCOPE_UPLOAD, "access_type": "offline", "prompt": "consent",
+        "include_granted_scopes": "true"})
+
+
+def exchange(code):
+    cid, sec = client()
+    r = requests.post("https://oauth2.googleapis.com/token", timeout=30, data={
+        "client_id": cid, "client_secret": sec, "code": code,
+        "grant_type": "authorization_code", "redirect_uri": REDIRECT})
+    r.raise_for_status()
+    tok = r.json()
+    if "refresh_token" not in tok:
+        sys.exit("no refresh_token returned — re-run auth-url (prompt=consent) and approve again")
+    fd = os.open(TOKENS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"refresh_token": tok["refresh_token"]}, f)
+    print(f"refresh token stored in {TOKENS}")
+
+
+def access_token():
+    cid, sec = client()
+    try:
+        refresh = json.load(open(TOKENS))["refresh_token"]
+    except (FileNotFoundError, KeyError, ValueError):
+        sys.exit("no refresh token yet — run `auth-url` then `exchange <code>` once")
+    r = requests.post("https://oauth2.googleapis.com/token", timeout=30, data={
+        "client_id": cid, "client_secret": sec, "refresh_token": refresh,
+        "grant_type": "refresh_token"})
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def upload(path, title, description, tags, privacy):
+    """Resumable videos.insert. Returns the new video id."""
+    size = os.path.getsize(path)
+    body = {
+        "snippet": {"title": title[:100], "description": description,
+                    "tags": tags, "categoryId": "22"},
+        "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
+    }
+    at = access_token()
+    start = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/videos",
+        params={"uploadType": "resumable", "part": "snippet,status"},
+        headers={"Authorization": f"Bearer {at}", "Content-Type": "application/json",
+                 "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": str(size)},
+        data=json.dumps(body), timeout=60)
+    if start.status_code == 429:
+        sys.exit(f"429 upload quota: {start.text[:300]}")
+    start.raise_for_status()
+    session = start.headers["Location"]
+
+    sent = 0
+    with open(path, "rb") as f:
+        while sent < size:
+            chunk = f.read(CHUNK)
+            end = sent + len(chunk) - 1
+            for attempt in range(5):
+                r = requests.put(session, data=chunk, timeout=600, headers={
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {sent}-{end}/{size}"})
+                if r.status_code in (200, 201, 308):
+                    break
+                if r.status_code in (500, 502, 503, 504):
+                    time.sleep(2 ** attempt)
+                    continue
+                sys.exit(f"upload failed HTTP {r.status_code}: {r.text[:300]}")
+            else:
+                sys.exit("upload failed after 5 retries")
+            sent = end + 1
+            print(f"  {sent}/{size} bytes", flush=True)
+            if r.status_code in (200, 201):
+                vid = r.json()["id"]
+                print(f"video id {vid}  https://youtu.be/{vid}")
+                return vid
+    sys.exit("upload ended without a final response")
+
+
+def status(video_id):
+    at = access_token()  # needs youtube.readonly as well; optional check
+    r = requests.get("https://www.googleapis.com/youtube/v3/videos", timeout=30,
+                     params={"part": "status,processingDetails,snippet", "id": video_id},
+                     headers={"Authorization": f"Bearer {at}"})
+    r.raise_for_status()
+    items = r.json().get("items") or []
+    if not items:
+        sys.exit("no such video (or not ours)")
+    it = items[0]
+    if it["snippet"]["channelId"] != CHANNEL_ID:
+        sys.exit("refusing: that video is not on the Ridvise channel")
+    print(json.dumps({"id": video_id, **it["status"],
+                      "processing": it["processingDetails"].get("processingStatus")}, indent=2))
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("auth-url")
+    p = sub.add_parser("exchange"); p.add_argument("code")
+    p = sub.add_parser("upload")
+    p.add_argument("file")
+    p.add_argument("--title", required=True)
+    p.add_argument("--description", default="")
+    p.add_argument("--tags", default="shorts")
+    p.add_argument("--privacy", default="public", choices=["public", "unlisted", "private"])
+    p = sub.add_parser("status"); p.add_argument("video_id")
+    a = ap.parse_args()
+
+    if a.cmd == "auth-url":
+        print(auth_url())
+    elif a.cmd == "exchange":
+        exchange(a.code)
+    elif a.cmd == "upload":
+        upload(a.file, a.title, a.description,
+               [t.strip() for t in a.tags.split(",") if t.strip()], a.privacy)
+    elif a.cmd == "status":
+        status(a.video_id)
