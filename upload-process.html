@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ridvise Publisher — how videos are uploaded to YouTube</title><style>:root{color-scheme:light}
+body{font-family:-apple-system,Helvetica,Arial;max-width:900px;margin:56px auto;padding:0 20px;color:#1c1c1c;line-height:1.62}
+h1{font-size:30px;margin-bottom:2px}h2{font-size:21px;margin-top:44px;border-bottom:2px solid #eee;padding-bottom:6px}
+h3{font-size:16px;margin-top:26px}
+a{color:#c33}code{font-family:Menlo,monospace;font-size:13px;background:#f5f5f5;padding:1px 5px;border-radius:4px}
+code a{text-decoration:none}
+pre{font-family:Menlo,monospace;font-size:12px;background:#f5f5f5;padding:16px;border-radius:8px;overflow-x:auto;line-height:1.5}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:10px 0}
+td,th{border-bottom:1px solid #eee;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#fafafa;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#666}
+img{max-width:100%;border:1px solid #ddd;border-radius:8px;margin:10px 0}
+.art img{width:120px;height:auto;border-radius:6px;margin:4px}
+.lede{color:#555;font-size:17px}.small{color:#666;font-size:14px}
+.box{border:1px solid #e3e3e3;border-left:4px solid #c33;border-radius:6px;padding:14px 18px;margin:18px 0;background:#fcfcfc}
+ul li,ol li{margin:6px 0}</style></head><body>
+
+<h1>Ridvise Publisher — how videos are uploaded to YouTube</h1>
+<p class="lede">Supporting material for the YouTube API Services compliance review of the OAuth
+client in Google Cloud project <code>ridvise-publisher</code> (project number 772198144313),
+submitted by Anthony Benyameen, <a href="mailto:antbenyameen@gmail.com">antbenyameen@gmail.com</a>.</p>
+
+<div class="box">
+<b>The request was for the uploading script and the end results.</b> The complete uploader is
+reproduced verbatim in <a href="#script">The uploading script</a>. The end results — every video
+this pipeline has put on the channel, with screenshots of the channel and of a live video — are in
+<a href="#results">End results</a>. Section <a href="#quota">Why the quota is needed</a> lists the
+individual uploads that failed with HTTP 429 on our current shared project, with file hashes.
+</div>
+
+<h2 id="what">What the API client does</h2>
+<ul>
+<li><b>One owner, one channel, no other users.</b> Ridvise Publisher is a private tool written and
+operated by one person for his own YouTube channel. It is not distributed, not sold, has no
+sign-up, no other users and no multi-tenant flow. Nobody else can connect an account to it.</li>
+<li><b>Upload only.</b> The only scope it needs is
+<code>https://www.googleapis.com/auth/youtube.upload</code>, which is write-only. It does not read,
+search, download, scrape or store anyone else's videos, channels, comments, thumbnails or
+statistics, and it displays no YouTube data to any end user. There is no public interface of any
+kind — the tool has no UI beyond a command line on one laptop.</li>
+<li><b>Only our own original videos, only to our own channel.</b> Every video is produced by us from
+our own written scripts, our own illustrated characters and our own licensed synthetic narration.
+Uploads go to the Ridvise channel, <a href="https://www.youtube.com/@ridviseyt">youtube.com/@ridviseyt</a>
+(<code>UCWEzr4vn2ja8_cMbEyxEG9g</code>), owned by the same Google account that owns the project.
+The uploader hard-codes that channel id and refuses to report on a video that is not on it.</li>
+<li><b>Volume.</b> At most nine uploads a day, one per scheduled slot. That is why the application
+asked for 20 <code>videos.insert</code> per day and the default 10,000 units — it is a small,
+fixed, entirely predictable load.</li>
+<li><b>No other API surface.</b> We deliberately verify that an upload went live by fetching the
+public watch page and the public oEmbed endpoint instead of calling <code>videos.list</code>, so
+our read quota stays at essentially zero.</li>
+</ul>
+
+<h2 id="calls">Exactly which API calls are made</h2>
+<table>
+<tr><th>When</th><th>Call</th><th>Purpose</th></tr>
+<tr><td>Once, at setup</td><td><code>POST https://oauth2.googleapis.com/token</code></td>
+<td>Exchange the authorization code for a refresh token, stored locally with mode 600.</td></tr>
+<tr><td>Before each upload</td><td><code>POST https://oauth2.googleapis.com/token</code> (refresh)</td>
+<td>Get a short-lived access token.</td></tr>
+<tr><td>Once per video</td>
+<td><code>POST https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&amp;part=snippet,status</code></td>
+<td>Start the resumable upload session; body carries the snippet and status below.</td></tr>
+<tr><td>8&nbsp;MB at a time</td><td><code>PUT &lt;resumable session URL&gt;</code></td>
+<td>Send the file bytes, with retry on 5xx.</td></tr>
+<tr><td>Optional, rarely</td><td><code>GET https://www.googleapis.com/youtube/v3/videos?part=status,processingDetails</code></td>
+<td>Confirm processing on our own video only. Normally skipped in favour of the public watch page.</td></tr>
+</table>
+<pre>snippet: { title, description, tags, categoryId: "22" }
+status:  { privacyStatus: "public", selfDeclaredMadeForKids: false }</pre>
+
+<h2 id="pipeline">How a video gets made and uploaded, end to end</h2>
+<ol>
+<li><b>We write the script.</b> Each video starts as a JSON file in our own queue: the topic, the
+lines each character says, the caption and description, and which voice reads which line. 59
+of these have been produced so far. A real one, abridged:
+<pre>{
+  &quot;title&quot;: &quot;v026_buffett_no_dividend&quot;,
+  &quot;channel&quot;: &quot;Ridvise&quot;,
+  &quot;music&quot;: &quot;music/docubed_b.mp3&quot;,
+  &quot;voices&quot;: {
+    &quot;dumb&quot;: {
+      &quot;provider&quot;: &quot;elevenlabs&quot;,
+      &quot;voice&quot;: &quot;zSiMZcCo0oBh047sunsX&quot;,
+      &quot;model_id&quot;: &quot;eleven_multilingual_v2&quot;
+    },
+    &quot;smart&quot;: {
+      &quot;provider&quot;: &quot;elevenlabs&quot;,
+      &quot;voice&quot;: &quot;nzFihrBIvB34imQBuxub&quot;,
+      &quot;model_id&quot;: &quot;eleven_multilingual_v2&quot;,
+      &quot;post_speed&quot;: 1.07
+    }
+  },
+  &quot;captions&quot;: {
+    &quot;hook&quot;: &quot;Why has Buffett&#x27;s company made billions and refused to pay a dividend for almost sixty years?&quot;,
+    &quot;tiktok&quot;: &quot;Why Buffett refuses to pay dividends #warrenbuffett #investing #dividends #personalfinance #moneytips&quot;,
+    &quot;instagram&quot;: &quot;Why Buffett refuses to pay dividends #warrenbuffett #investing #dividends #moneytips #personalfinance&quot;,
+    &quot;youtube_title&quot;: &quot;Why Warren Buffett&#x27;s Company Refuses to Pay Dividends #shorts&quot;,
+    &quot;desc&quot;: &quot;Berkshire Hathaway has paid one dividend since Buffett took over: ten cents a share in 1967. Dividends in a regular account are taxed the year you get them, while kept earnings keep compounding until you choose to sell.&quot;
+  }
+}</pre>
+<pre>[
+  {
+    &quot;who&quot;: &quot;dumb&quot;,
+    &quot;text&quot;: &quot;Why has Buffett&#x27;s company made billions and refused to pay a dividend for almost sixty years?&quot;,
+    &quot;props&quot;: [
+      {
+        &quot;at&quot;: &quot;Buffett&#x27;s company&quot;,
+        &quot;photo&quot;: &quot;Berkshire Hathaway&quot;
+      },
+      {
+        &quot;at&quot;: &quot;made billions&quot;,
+        &quot;prop&quot;: &quot;mountain of green cash&quot;
+      },
+      {
+        &quot;at&quot;: &quot;pay a dividend&quot;,
+        &quot;prop&quot;: &quot;hand receiving cash&quot;
+      },
+      {
+        &quot;at&quot;: &quot;sixty years&quot;,
+        &quot;prop&quot;: &quot;hourglass&quot;
+      }
+    ]
+  },
+  {
+    &quot;who&quot;: &quot;smart&quot;,
+    &quot;text&quot;: &quot;It sent one. Ten cents a share in 1967. Buffett joked he was in the bathroom.&quot;,
+    &quot;photo&quot;: &quot;Warren Buffett&quot;,
+    &quot;props&quot;: [
+      {
+        &quot;at&quot;: &quot;Ten cents&quot;,
+        &quot;prop&quot;: &quot;single copper penny&quot;
+      },
+      {
+        &quot;at&quot;: &quot;Buffett joked&quot;,
+        &quot;photo&quot;: &quot;Warren Buffett&quot;
+      },
+      {
+        &quot;at&quot;: &quot;bathroom&quot;,
+        &quot;prop&quot;: &quot;toilet&quot;
+      }
+    ]
+  },
+  {
+    &quot;who&quot;: &quot;dumb&quot;,
+    &quot;text&quot;: &quot;Wait, what? The most famous investor alive turns down free money?&quot;,
+    &quot;props&quot;: [
+      {
+        &quot;at&quot;: &quot;famous investor&quot;,
+        &quot;photo&quot;: &quot;Warren Buffett&quot;
+      },
+      {
+        &quot;at&quot;: &quot;free money&quot;,
+        &quot;prop&quot;: &quot;hand receiving cash&quot;
+      }
+    ]
+  },
+  {
+    &quot;who&quot;: &quot;smart&quot;,
+    &quot;text&quot;: &quot;It isn&#x27;t free. He&#x27;s dodging a tax most people never notice.&quot;,
+    &quot;props&quot;: [
+      {
+        &quot;at&quot;: &quot;isn&#x27;t free&quot;,
+        &quot;prop&quot;: &quot;price tag with an arrow going up&quot;
+      },
+      {
+        &quot;at&quot;: &quot;dodging a tax&quot;,
+        &quot;prop&quot;: &quot;tax form torn in half&quot;
+      }
+    ]
+  }
+]</pre></li>
+<li><b>We draw the characters.</b> The two recurring characters are our own illustrations,
+generated from our own reference plates and used across every video. Some of the reference art:
+<div class="art">
+<img src="ref/rich_idle.png" alt="Reference art: the advisor character"><img src="ref/broke_idle.png" alt="Reference art: the second character"><img src="ref/S04_explain.png" alt="Reference pose: explaining"><img src="ref/D03_shocked.png" alt="Reference pose: shocked"><img src="ref/S16_finger_up.png" alt="Reference pose: making a point"><img src="ref/D08_sad.png" alt="Reference pose: dejected">
+</div></li>
+<li><b>We render it locally.</b> A Python program builds the narration from a licensed
+text-to-speech voice, lays the art and captions on a timeline and renders the MP4 with ffmpeg.
+Nothing in the video is taken from YouTube or from anyone else's video. A finished example, served
+straight from this site: <a href="videos/v001.mp4">v001.mp4</a>.</li>
+<li><b>We hash the render.</b> The finished file's sha256 and byte size are recorded before upload,
+so a corrupted transfer can never reach YouTube. (We added this after one truncated upload was
+rejected by YouTube with "Can't process file".)</li>
+<li><b>We upload it</b> with the script in the next section: one resumable
+<code>videos.insert</code>, <code>privacyStatus: "public"</code>.</li>
+<li><b>We verify it is live</b> by fetching the public watch page and oEmbed endpoint — not the API
+— and record the video id in our posting log.</li>
+<li><b>If the upload fails</b> the title, local path, size, sha256 and the exact metadata go into a
+small backlog file, and a nightly job retries it after the daily limit resets. A video is never
+uploaded twice: the backlog entry is cleared only once an id comes back.</li>
+</ol>
+
+<h2 id="script">The uploading script</h2>
+<p class="small"><code>yt_upload.py</code>, complete and verbatim. The OAuth client id and secret
+are read from a local file outside any repository and are never printed or logged.</p>
+<pre>#!/usr/bin/env python3
+&quot;&quot;&quot;Ridvise Publisher — uploads a finished Ridvise video to the Ridvise YouTube channel.
+
+This is the uploader for the OAuth client under YouTube API Services review:
+Google Cloud project &quot;ridvise-publisher&quot; (project number 772198144313), OAuth client
+&quot;Ridvise Composio uploader&quot;. It is a private, single-operator tool. It only ever uploads
+videos that Ridvise produced itself, and only to Ridvise&#x27;s own channel
+(UCWEzr4vn2ja8_cMbEyxEG9g, youtube.com/@ridviseyt). It does not read, download, search,
+scrape or store anyone else&#x27;s content, and there are no other users.
+
+Scope used: https://www.googleapis.com/auth/youtube.upload  (write-only; it cannot read
+another channel&#x27;s data). `status` additionally needs youtube.readonly and is optional —
+the pipeline normally confirms a public upload by fetching the watch page instead, so the
+read quota stays untouched.
+
+Client id / secret live in ~/ClaudeBrain/secrets/google_ridvise_publisher_oauth.env
+(chmod 600, never printed, never committed). The refresh token is written next to them.
+
+    python3 yt_upload.py auth-url                     # one-time: print the consent URL
+    python3 yt_upload.py exchange &lt;code&gt;              # one-time: store the refresh token
+    python3 yt_upload.py upload out/v031/v031_yt.mp4 \
+        --title &quot;...&quot; --description &quot;...&quot; --tags shorts,money --privacy public
+    python3 yt_upload.py status &lt;video_id&gt;            # uploadStatus / processing result
+
+Upload call: resumable POST to
+    https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&amp;part=snippet,status
+with snippet{title, description, tags, categoryId &quot;22&quot;} and status{privacyStatus,
+selfDeclaredMadeForKids false}, then the file bytes PUT to the returned session URL.
+One video per scheduled slot; at most nine uploads a day.
+&quot;&quot;&quot;
+import argparse, json, os, sys, time, urllib.parse
+import requests
+
+SECRETS = os.path.expanduser(&quot;~/ClaudeBrain/secrets/google_ridvise_publisher_oauth.env&quot;)
+TOKENS = os.path.expanduser(&quot;~/ClaudeBrain/secrets/google_ridvise_publisher_token.json&quot;)
+REDIRECT = os.environ.get(&quot;RIDVISE_OAUTH_REDIRECT&quot;,
+                          &quot;https://backend.composio.dev/api/v3/toolkits/auth/callback&quot;)
+SCOPE_UPLOAD = &quot;https://www.googleapis.com/auth/youtube.upload&quot;
+CHANNEL_ID = &quot;UCWEzr4vn2ja8_cMbEyxEG9g&quot;  # Ridvise. Never upload anywhere else.
+CHUNK = 8 * 1024 * 1024
+
+
+def client():
+    &quot;&quot;&quot;Read the OAuth client id/secret. Returns them; never logs or prints them.&quot;&quot;&quot;
+    cid = secret = None
+    with open(SECRETS) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(&quot;GOOGLE_CLIENT_ID=&quot;):
+                cid = line.split(&quot;=&quot;, 1)[1].strip().strip(&#x27;&quot;&#x27;)
+            elif line.startswith(&quot;GOOGLE_CLIENT_SECRET=&quot;):
+                secret = line.split(&quot;=&quot;, 1)[1].strip().strip(&#x27;&quot;&#x27;)
+    if not (cid and secret):
+        sys.exit(f&quot;client id/secret missing from {SECRETS}&quot;)
+    return cid, secret
+
+
+def auth_url():
+    cid, _ = client()
+    return &quot;https://accounts.google.com/o/oauth2/v2/auth?&quot; + urllib.parse.urlencode({
+        &quot;client_id&quot;: cid, &quot;redirect_uri&quot;: REDIRECT, &quot;response_type&quot;: &quot;code&quot;,
+        &quot;scope&quot;: SCOPE_UPLOAD, &quot;access_type&quot;: &quot;offline&quot;, &quot;prompt&quot;: &quot;consent&quot;,
+        &quot;include_granted_scopes&quot;: &quot;true&quot;})
+
+
+def exchange(code):
+    cid, sec = client()
+    r = requests.post(&quot;https://oauth2.googleapis.com/token&quot;, timeout=30, data={
+        &quot;client_id&quot;: cid, &quot;client_secret&quot;: sec, &quot;code&quot;: code,
+        &quot;grant_type&quot;: &quot;authorization_code&quot;, &quot;redirect_uri&quot;: REDIRECT})
+    r.raise_for_status()
+    tok = r.json()
+    if &quot;refresh_token&quot; not in tok:
+        sys.exit(&quot;no refresh_token returned — re-run auth-url (prompt=consent) and approve again&quot;)
+    fd = os.open(TOKENS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, &quot;w&quot;) as f:
+        json.dump({&quot;refresh_token&quot;: tok[&quot;refresh_token&quot;]}, f)
+    print(f&quot;refresh token stored in {TOKENS}&quot;)
+
+
+def access_token():
+    cid, sec = client()
+    try:
+        refresh = json.load(open(TOKENS))[&quot;refresh_token&quot;]
+    except (FileNotFoundError, KeyError, ValueError):
+        sys.exit(&quot;no refresh token yet — run `auth-url` then `exchange &lt;code&gt;` once&quot;)
+    r = requests.post(&quot;https://oauth2.googleapis.com/token&quot;, timeout=30, data={
+        &quot;client_id&quot;: cid, &quot;client_secret&quot;: sec, &quot;refresh_token&quot;: refresh,
+        &quot;grant_type&quot;: &quot;refresh_token&quot;})
+    r.raise_for_status()
+    return r.json()[&quot;access_token&quot;]
+
+
+def upload(path, title, description, tags, privacy):
+    &quot;&quot;&quot;Resumable videos.insert. Returns the new video id.&quot;&quot;&quot;
+    size = os.path.getsize(path)
+    body = {
+        &quot;snippet&quot;: {&quot;title&quot;: title[:100], &quot;description&quot;: description,
+                    &quot;tags&quot;: tags, &quot;categoryId&quot;: &quot;22&quot;},
+        &quot;status&quot;: {&quot;privacyStatus&quot;: privacy, &quot;selfDeclaredMadeForKids&quot;: False},
+    }
+    at = access_token()
+    start = requests.post(
+        &quot;https://www.googleapis.com/upload/youtube/v3/videos&quot;,
+        params={&quot;uploadType&quot;: &quot;resumable&quot;, &quot;part&quot;: &quot;snippet,status&quot;},
+        headers={&quot;Authorization&quot;: f&quot;Bearer {at}&quot;, &quot;Content-Type&quot;: &quot;application/json&quot;,
+                 &quot;X-Upload-Content-Type&quot;: &quot;video/mp4&quot;, &quot;X-Upload-Content-Length&quot;: str(size)},
+        data=json.dumps(body), timeout=60)
+    if start.status_code == 429:
+        sys.exit(f&quot;429 upload quota: {start.text[:300]}&quot;)
+    start.raise_for_status()
+    session = start.headers[&quot;Location&quot;]
+
+    sent = 0
+    with open(path, &quot;rb&quot;) as f:
+        while sent &lt; size:
+            chunk = f.read(CHUNK)
+            end = sent + len(chunk) - 1
+            for attempt in range(5):
+                r = requests.put(session, data=chunk, timeout=600, headers={
+                    &quot;Content-Length&quot;: str(len(chunk)),
+                    &quot;Content-Range&quot;: f&quot;bytes {sent}-{end}/{size}&quot;})
+                if r.status_code in (200, 201, 308):
+                    break
+                if r.status_code in (500, 502, 503, 504):
+                    time.sleep(2 ** attempt)
+                    continue
+                sys.exit(f&quot;upload failed HTTP {r.status_code}: {r.text[:300]}&quot;)
+            else:
+                sys.exit(&quot;upload failed after 5 retries&quot;)
+            sent = end + 1
+            print(f&quot;  {sent}/{size} bytes&quot;, flush=True)
+            if r.status_code in (200, 201):
+                vid = r.json()[&quot;id&quot;]
+                print(f&quot;video id {vid}  https://youtu.be/{vid}&quot;)
+                return vid
+    sys.exit(&quot;upload ended without a final response&quot;)
+
+
+def status(video_id):
+    at = access_token()  # needs youtube.readonly as well; optional check
+    r = requests.get(&quot;https://www.googleapis.com/youtube/v3/videos&quot;, timeout=30,
+                     params={&quot;part&quot;: &quot;status,processingDetails,snippet&quot;, &quot;id&quot;: video_id},
+                     headers={&quot;Authorization&quot;: f&quot;Bearer {at}&quot;})
+    r.raise_for_status()
+    items = r.json().get(&quot;items&quot;) or []
+    if not items:
+        sys.exit(&quot;no such video (or not ours)&quot;)
+    it = items[0]
+    if it[&quot;snippet&quot;][&quot;channelId&quot;] != CHANNEL_ID:
+        sys.exit(&quot;refusing: that video is not on the Ridvise channel&quot;)
+    print(json.dumps({&quot;id&quot;: video_id, **it[&quot;status&quot;],
+                      &quot;processing&quot;: it[&quot;processingDetails&quot;].get(&quot;processingStatus&quot;)}, indent=2))
+
+
+if __name__ == &quot;__main__&quot;:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest=&quot;cmd&quot;, required=True)
+    sub.add_parser(&quot;auth-url&quot;)
+    p = sub.add_parser(&quot;exchange&quot;); p.add_argument(&quot;code&quot;)
+    p = sub.add_parser(&quot;upload&quot;)
+    p.add_argument(&quot;file&quot;)
+    p.add_argument(&quot;--title&quot;, required=True)
+    p.add_argument(&quot;--description&quot;, default=&quot;&quot;)
+    p.add_argument(&quot;--tags&quot;, default=&quot;shorts&quot;)
+    p.add_argument(&quot;--privacy&quot;, default=&quot;public&quot;, choices=[&quot;public&quot;, &quot;unlisted&quot;, &quot;private&quot;])
+    p = sub.add_parser(&quot;status&quot;); p.add_argument(&quot;video_id&quot;)
+    a = ap.parse_args()
+
+    if a.cmd == &quot;auth-url&quot;:
+        print(auth_url())
+    elif a.cmd == &quot;exchange&quot;:
+        exchange(a.code)
+    elif a.cmd == &quot;upload&quot;:
+        upload(a.file, a.title, a.description,
+               [t.strip() for t in a.tags.split(&quot;,&quot;) if t.strip()], a.privacy)
+    elif a.cmd == &quot;status&quot;:
+        status(a.video_id)
+</pre>
+
+<h2 id="results">End results</h2>
+<p>The Ridvise channel and one of the uploaded videos, on YouTube:</p>
+<img src="shots/channel-shorts.png" alt="The Ridvise channel Shorts tab on YouTube">
+<img src="shots/channel-videos.png" alt="The Ridvise channel Videos tab on YouTube">
+<img src="shots/watch-latest.png" alt="A Ridvise video playing on its YouTube watch page">
+<p>Every video below was written, drawn, narrated and rendered by us, and put on the channel by
+this pipeline. All are public and live. These are the 57 recorded in our posting log; the
+channel shows the full count.</p>
+<table><tr><th>Video id</th><th>Title</th></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=VWjhl1A3B1Y">VWjhl1A3B1Y</a></code></td><td>Why You&#x27;re STILL Broke (Even After a Raise)</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=4W84u13KomU">4W84u13KomU</a></code></td><td>Is Working Two Jobs Actually Worth It? #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=mj1j8MW7nRY">mj1j8MW7nRY</a></code></td><td>How To Make Real Money While You&#x27;re Still In School #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=l1rSJ-LS6Sc">l1rSJ-LS6Sc</a></code></td><td>The Case Supporters Make For Trump #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=kOuWzmAbfzs">kOuWzmAbfzs</a></code></td><td>How To Leave Money To Your Kids (Without Losing Half) #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=t-7Vj5wVcew">t-7Vj5wVcew</a></code></td><td>What Your Credit Score Actually Measures #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=qa7_-NF38RE">qa7_-NF38RE</a></code></td><td>The Rule of 72: How Fast Your Money Doubles #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=AwyIvaATrWw">AwyIvaATrWw</a></code></td><td>Why High Earners Still Go Broke #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=4MHhiDxdvXk">4MHhiDxdvXk</a></code></td><td>Your First Bank Account At 16 (Avoid These Fees) #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=SDOBgO65iyo">SDOBgO65iyo</a></code></td><td>The $9.99 Subscription Trap Companies Count On #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=CUYkid1jcaA">CUYkid1jcaA</a></code></td><td>Your Wife Never Worked? She Still Gets Social Security #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=AEm5qL4igzk">AEm5qL4igzk</a></code></td><td>The Secret Airport Warehouses Full Of Billionaires&#x27; Art #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=uCQ8mrZ9gg8">uCQ8mrZ9gg8</a></code></td><td>Why Warren Buffett&#x27;s Company Refuses to Pay Dividends #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=rgxBLFXaNPM">rgxBLFXaNPM</a></code></td><td>Why McDonald&#x27;s Is Actually a Real Estate Company #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=jU2UqDQjy90">jU2UqDQjy90</a></code></td><td>Why Billionaires Borrow at 2% and You Pay 24% #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=W1yH6376AnM">W1yH6376AnM</a></code></td><td>How a Gas Station Janitor Died With $8 Million #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=2tyPltR9_vM">2tyPltR9_vM</a></code></td><td>Why Turning Down a 401k Match Is Refusing Free Money #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=q0TCznM-Z7s">q0TCznM-Z7s</a></code></td><td>Why Buying New Cars Keeps You Broke #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=0zexvy_6a80">0zexvy_6a80</a></code></td><td>How To Pay For College Without Drowning In Debt #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=QZmREyc-iRI">QZmREyc-iRI</a></code></td><td>How To Afford Rent On One Income #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=-a4bhCvhG88">-a4bhCvhG88</a></code></td><td>Why Index Funds Beat 90% of Professionals #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=gImpBW4s9J4">gImpBW4s9J4</a></code></td><td>Is It Too Late To Save For Retirement At 60? #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=psnLXmmFQSw">psnLXmmFQSw</a></code></td><td>Why You Need Six Months of Expenses Saved #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=EXWRJ8ZLHGA">EXWRJ8ZLHGA</a></code></td><td>The Only Triple Tax-Free Account In America #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=i-u0iUP8FGQ">i-u0iUP8FGQ</a></code></td><td>Why Your Credit Card Balance Won&#x27;t Go Down #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=s7WC8iqTwjo">s7WC8iqTwjo</a></code></td><td>How To Build Credit Before You Turn 18 #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=y00zDCaL4-A">y00zDCaL4-A</a></code></td><td>Do You Owe Tax When You Sell Your House? #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=i1QnHfuLdaA">i1QnHfuLdaA</a></code></td><td>The Number Where You Never Have To Work Again #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=UnRmDqhobig">UnRmDqhobig</a></code></td><td>Costco Doesn&#x27;t Make Money Selling You Food #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=u8Y47OnR5eY">u8Y47OnR5eY</a></code></td><td>Waiting 10 Years Costs You $600,000 #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=ozQDHD1HUrs">ozQDHD1HUrs</a></code></td><td>How To Actually Ask For A Raise #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=g8mGsB5h9js">g8mGsB5h9js</a></code></td><td>Why Your First Paycheck Is So Much Smaller Than You Expected #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=X0Bob9isMI4">X0Bob9isMI4</a></code></td><td>The IRS Forces You To Drain Your IRA At 73 #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=3Nj6DMN-MDo">3Nj6DMN-MDo</a></code></td><td>Dealerships Make More On The Loan Than The Car #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=5VeyTIpj4uU">5VeyTIpj4uU</a></code></td><td>Why Your Savings Account Is Losing Money #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=FraYfcOmHZ8">FraYfcOmHZ8</a></code></td><td>Why Rich People Never Pay Off Their Mortgage Early #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=8Tj_nsXflp8">8Tj_nsXflp8</a></code></td><td>Is Working Worth It After Daycare Costs? #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=dMQfUALvFX0">dMQfUALvFX0</a></code></td><td>Do Teenagers Actually Have To File Taxes? #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=1iSjIcE8aSo">1iSjIcE8aSo</a></code></td><td>Social Security At 62 vs 70: The Real Difference #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=sDko-Yxm348">sDko-Yxm348</a></code></td><td>The Latte Myth: Coffee Isn&#x27;t Why You&#x27;re Broke #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=aFRjYmlE0uE">aFRjYmlE0uE</a></code></td><td>House Hacking: Live For Free While Tenants Pay Your Mortgage #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=d4ATis5OWPs">d4ATis5OWPs</a></code></td><td>Why 0% Interest Isn&#x27;t Actually Free #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=jR08MlVULeY">jR08MlVULeY</a></code></td><td>How To Build An Emergency Fund With Nothing Left Over #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=KQ9l3WdiCno">KQ9l3WdiCno</a></code></td><td>Car Loan At 17 Or Buy A Cheap Car With Cash? #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=I7tYfGKPSDg">I7tYfGKPSDg</a></code></td><td>Your Will Doesn&#x27;t Control Your IRA #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=ngrzviEBVAg">ngrzviEBVAg</a></code></td><td>Stop Waiting for the Crash: Dollar-Cost Averaging #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=pc4c5xc3QYw">pc4c5xc3QYw</a></code></td><td>Why Payday Loans Cost Almost 400% #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=IZvheMuc1p0">IZvheMuc1p0</a></code></td><td>Why Your Bank Pays You Nothing (And Charges You 20%) #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=w8vsiWBy1YQ">w8vsiWBy1YQ</a></code></td><td>How Peter Thiel Turned $2,000 Into $5 Billion Tax Free #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=pV52SL4-Kck">pV52SL4-Kck</a></code></td><td>Why Stores Push Extended Warranties So Hard #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=9j2aFwBAXxg">9j2aFwBAXxg</a></code></td><td>Why Your Credit Is Thin Even When You Pay Every Bill #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=Hk8xq0K_q-g">Hk8xq0K_q-g</a></code></td><td>Can You Actually Invest At 16? #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=7GCNcn6wTjI">7GCNcn6wTjI</a></code></td><td>Rich People Don&#x27;t Pay The Sticker Price #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=UDT36zCbBrk">UDT36zCbBrk</a></code></td><td>The Medicare Late Penalty That Never Goes Away #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=IzhYJPSzX8M">IzhYJPSzX8M</a></code></td><td>Why Overdraft Fees Are The Worst Loan In America #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=dJHrC6gRzwo">dJHrC6gRzwo</a></code></td><td>Why 9 Out Of 10 Stock Pickers Lose To A Boring Fund #shorts</td></tr>
+<tr><td><code><a href="https://www.youtube.com/watch?v=SvC5-pxgUOY">SvC5-pxgUOY</a></code></td><td>Never Pay The First Hospital Bill You Get #shorts</td></tr>
+</table>
+
+<h2 id="quota">Why the quota is needed</h2>
+<p>Today these uploads go out through a third-party automation host whose YouTube connector runs on
+<em>its own</em> Google Cloud project, shared by all of that host's customers. The per-project daily
+upload cap is therefore consumed by strangers, and our evening uploads fail with HTTP&nbsp;429
+<code>defaultVideoInsertPerDayPerProject</code> through no fault of our own. Each one then has to be
+re-uploaded after the midnight Pacific reset. Every row below is a real upload of ours that was
+delayed this way, with the hash of the exact file that eventually went up:</p>
+<table><tr><th>Failed at</th><th>Bytes</th><th>sha256</th><th>Reason</th><th>Uploaded as</th></tr>
+<tr><td>2026-09-14 23:18</td><td><code>16015767</code></td><td>2929eed8af8334b3…</td><td><code>YouTube &#x27;Can&#x27;t process file&#x27; at 6 PM, then 429 on re-upload</code></td><td><code><a href="https://youtube.com/watch?v=FraYfcOmHZ8">FraYfcOmHZ8</a></code></td></tr>
+<tr><td>2026-09-14 23:18</td><td><code>14043108</code></td><td>9beb6dce63d5964a…</td><td><code>429 Video Uploads per day (Composio shared cap) at 11 PM</code></td><td><code><a href="https://youtube.com/watch?v=8Tj_nsXflp8">8Tj_nsXflp8</a></code></td></tr>
+<tr><td>2026-09-15 23:05</td><td><code>15511308</code></td><td>17f71afb7ad189ce…</td><td><code>429 Video Uploads per day quota (defaultVideoInsertPerDayPerProject) at 11PM slo</code></td><td><code><a href="https://youtube.com/watch?v=jR08MlVULeY">jR08MlVULeY</a></code></td></tr>
+<tr><td>2026-09-16 11:19</td><td><code>16947983</code></td><td>97c0a44081511f20…</td><td><code>uploaded 11:10 as 5gLhMpTv6bk, then vanished: owner API returns no results, watc</code></td><td><code><a href="https://youtube.com/watch?v=ngrzviEBVAg">ngrzviEBVAg</a></code></td></tr>
+<tr><td>2026-09-16 15:14</td><td><code>17435013</code></td><td>3a12535e5a6ea625…</td><td><code>YouTube 429 Video Uploads per day (3 PM slot 2026-09-16)</code></td><td><code><a href="https://youtube.com/watch?v=pc4c5xc3QYw">pc4c5xc3QYw</a></code></td></tr>
+<tr><td>2026-09-16 17:06</td><td><code>15353646</code></td><td>09c737a69fe8ef2b…</td><td><code>429 Video Uploads per day (Composio shared cap), posted manually 2026-09-16 17:0</code></td><td><code><a href="https://youtube.com/watch?v=IZvheMuc1p0">IZvheMuc1p0</a></code></td></tr>
+<tr><td>2026-09-16 18:11</td><td><code>8571434</code></td><td>79142396c08a13e9…</td><td><code>429 Video Uploads per day (6 PM slot)</code></td><td><code><a href="https://youtube.com/watch?v=w8vsiWBy1YQ">w8vsiWBy1YQ</a></code></td></tr>
+<tr><td>2026-09-16 20:59</td><td><code>12965035</code></td><td>8268d605cf36c9c7…</td><td><code>429 Video Uploads per day (shared Composio project), 8 PM solo slot</code></td><td><code><a href="https://youtube.com/watch?v=pV52SL4-Kck">pV52SL4-Kck</a></code></td></tr>
+<tr><td>2026-09-16 23:07</td><td><code>7105320</code></td><td>67d8eaa8769d6f80…</td><td><code>YouTube 429 Video Uploads per day (defaultVideoInsertPerDayPerProject) at 11 PM </code></td><td><code><a href="https://youtube.com/watch?v=9j2aFwBAXxg">9j2aFwBAXxg</a></code></td></tr>
+<tr><td>2026-09-17 20:06</td><td><code>13724526</code></td><td>407f71f66d05da89…</td><td><code>429 daily video upload quota exceeded on shared Composio project</code></td><td><code><a href="https://youtube.com/watch?v=dJHrC6gRzwo">dJHrC6gRzwo</a></code></td></tr>
+<tr><td>2026-09-17 23:07</td><td><code>7460732</code></td><td>d9e23a586052936e…</td><td><code>429 Video Uploads per day quota exceeded (defaultVideoInsertPerDayPerProject)</code></td><td><code><a href="https://youtube.com/watch?v=SvC5-pxgUOY">SvC5-pxgUOY</a></code></td></tr>
+</table>
+<p>Our own project with its own modest quota removes that shared-pool collision entirely. The usage
+does not grow: the same nine videos a day, to the same one channel.</p>
+
+<h2 id="compliance">Compliance</h2>
+<ul>
+<li>We upload only content we created and own, and we hold the rights to the voices, music and
+artwork used in it.</li>
+<li>We store no YouTube user data. The only credential kept is our own refresh token, in a
+600-mode file on one machine; it is revocable at any time from the Google account.</li>
+<li>Access is never shared, resold or exposed to third parties, and the tool is not published.</li>
+<li>Our use of YouTube API Services is governed by the
+<a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a> and the
+<a href="https://policies.google.com/privacy">Google Privacy Policy</a>; our own terms are in
+<a href="privacy.html">Privacy Policy</a> and <a href="terms.html">Terms of Service</a>.</li>
+<li>Questions or anything further you need: <a href="mailto:antbenyameen@gmail.com">antbenyameen@gmail.com</a>.</li>
+</ul>
+
+<p class="small" style="margin-top:40px"><a href="index.html">Ridvise</a> ·
+<a href="privacy.html">Privacy Policy</a> · <a href="terms.html">Terms of Service</a></p>
+</body></html>
