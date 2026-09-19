@@ -42,10 +42,11 @@ kind — the tool has no UI beyond a command line on one laptop.</li>
 <li><b>Only our own original videos, only to our own channel.</b> Every video is produced by us from
 our own written scripts, our own illustrated characters and our own licensed synthetic narration.
 Uploads go to the Ridvise channel, <a href="https://www.youtube.com/@ridviseyt">youtube.com/@ridviseyt</a>
-(<code>UCWEzr4vn2ja8_cMbEyxEG9g</code>). The channel and the Google Cloud project are both mine:
-the project is under <code>antbenyameen@gmail.com</code> and the channel is under a second Google
-account of my own, which is the account that authorizes this client. The uploader hard-codes that
-channel id and refuses to report on a video that is not on it.</li>
+(<code>UCWEzr4vn2ja8_cMbEyxEG9g</code>). The channel and the Google Cloud project are both mine,
+under two Google accounts I own: the project <code>ridvise-publisher</code> is under
+<code>antbenyameen@gmail.com</code>, and the channel is under <code>linbear347@gmail.com</code>,
+which is the account that authorizes this client. The uploader hard-codes that channel id and
+refuses to report on a video that is not on it.</li>
 <li><b>Volume.</b> At most nine uploads a day, one per scheduled slot. That is why the application
 asked for 20 <code>videos.insert</code> per day and the default 10,000 units — it is a small,
 fixed, entirely predictable load.</li>
@@ -382,6 +383,12 @@ if __name__ == &quot;__main__&quot;:
 <img src="shots/channel-shorts.png" alt="The Ridvise channel Shorts tab on YouTube">
 <img src="shots/channel-videos.png" alt="The Ridvise channel Videos tab on YouTube">
 <img src="shots/watch-latest.png" alt="A Ridvise video playing on its YouTube watch page">
+<p>The same uploads inside YouTube Studio for the channel — every one public, every one with an
+empty Notices column, i.e. no copyright claims or strikes against any of them:</p>
+<img src="shots/studio-content.png" alt="YouTube Studio channel content list for the Ridvise channel">
+<p>And the channel's own analytics, where the daily bars under the graph show the upload cadence
+this quota request is sized for — single digits per day:</p>
+<img src="shots/studio-analytics.png" alt="YouTube Studio channel analytics for the Ridvise channel">
 <p>Every video below was written, drawn, narrated and rendered by us, and put on the channel by
 this pipeline. All are public and live. These are the 57 recorded in our posting log; the
 channel shows the full count.</p>
